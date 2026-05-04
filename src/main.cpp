@@ -259,11 +259,17 @@ void writeGrayData2D(std::ofstream &cpp, const std::vector<uint8_t> &texture, in
 
 
 /*
-    Usage: Label_Tool <text file>
+    Usage: FontTool <font> [options]
+        font: True Type font (.ttf)
+        options
+            <x>pt: Size (default is 8pt)
+            mono: Monochrome (default)
+            8bpp: 8 bit per pixel
+            tex: Output glyphs on 2D texture
 */
 int main(int argc, char **argv) {
-    SetConsoleOutputCP(CP_UTF8);
-    setvbuf(stdout, nullptr, _IOFBF, 1000);
+    //SetConsoleOutputCP(CP_UTF8);
+    //setvbuf(stdout, nullptr, _IOFBF, 1000);
     //std::cout << "Ω" << std::endl;
     if (argc < 2)
         return 1;
@@ -448,7 +454,7 @@ int main(int argc, char **argv) {
     }
 
     // write Glyph structures
-    cpp << "const Vector2<uint32_t> " << name << "Glyphs[] = {" << std::endl;
+    cpp << "const GlyphInfo " << name << "Glyphs[] = {" << std::endl;
     int height = 0;
     for (auto &info : glyphInfos) {
         int y = maxY - info.y;
@@ -479,7 +485,7 @@ int main(int argc, char **argv) {
 
     // write font
     int gapWidth = fontSize >= 10 ? 2 : 1;
-    cpp << "extern const Font " << name << " = {" << std::endl;
+    cpp << "extern const " << (tex ? "Texture" : "Linear") << "Font " << name << " = {" << std::endl;
     {
         //cpp << INDENT << "1, 2, 5, " << std::endl; // gapWidth, spaceWidth, tabWidth
         cpp << INDENT << gapWidth << "," << std::endl;
@@ -496,7 +502,7 @@ int main(int argc, char **argv) {
     hpp << std::endl;
     hpp << "#include \"header.hpp\"" << std::endl;
     hpp << std::endl;
-    hpp << "extern const Font " << name << ";" << std::endl;
+    hpp << "extern const " << (tex ? "Texture" : "Linear") << "Font " << name << ";" << std::endl;
     hpp << std::endl;
     hpp << "#include \"footer.hpp\"" << std::endl;
 }

@@ -9,249 +9,500 @@
 #include <iomanip>
 #include <map>
 #include <codecvt>
+#include <ranges>
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+// todo:
+// https://steamcdn-a.akamaihd.net/apps/valve/2007/SIGGRAPH2007_AlphaTestedMagnification.pdf
+// https://github.com/ShoYamanishi/SDFont
 
 
 namespace fs = std::filesystem;
 
+constexpr char INDENT[] = "    ";
+
 
 struct GlyphInfo {
-	int offset;
-	int s;
-	int y;
-	int w;
-	int h;
+    GlyphInfo(std::string_view text, bool printable = true) : text(text), printable(printable) {}
+
+    // text that is represented by this glyph (single character, utf-8 sequence, ligature)
+    std::string text;
+
+    bool printable;
+
+    // text as code point or offset into text data
+    int t;
+
+    // offset of glyph data in data array
+    int offset;
+
+    // top y coordinate of glyph
+    int y;
+
+    // size of glyph
+    int w;
+    int h;
+
+    // glyph data
+    std::vector<uint8_t> data;
 };
 
-void writeMonoBitmap(std::ofstream &cpp, uint8_t *buffer, int w, int h, int pitch) {
-	cpp << std::hex;
-	for (int j = 0; j < h; ++j) {
-		cpp << "\t";
-
-		// write bytes
-		for (int i = 0; i < (w + 7) / 8; ++i) {
-			cpp << "0x" << std::setw(2) << std::setfill('0') << int(buffer[i]) << ", ";
-		}
-
-		// write comment
-		cpp << "// ";
-		for (int i = 0; i < w; ++i) {
-			cpp << ((buffer[i / 8] & (0x80 >> (i & 7))) != 0 ? '#' : ' ');
-		}
-		cpp << std::endl;
-
-		buffer += pitch;
-	}
-	cpp << std::endl;
-	cpp << std::dec;
-}
-
-GlyphInfo addPlaceholder(std::ofstream &cpp, int &offset) {
-	GlyphInfo info;
-
-	info.offset = offset;
-	info.s = 0;
-	info.y = 8;
-	info.w = 7;
-	info.h = 8;
-
-	uint8_t buffer[] = {0xfe, 0xc6, 0xaa, 0x92, 0x92, 0xaa, 0xc6, 0xfe};
-
-	cpp << "\t// placeholder" << std::endl;
-	writeMonoBitmap(cpp, buffer, info.w, info.h, 1);
-
-	offset += 8;
-
-	return info;
+int toInt(const std::string &str) {
+    int s = 0;
+    for (char ch : str | std::views::reverse) {
+        s <<= 8;
+        s |= uint8_t(ch);
+    }
+    return s;
 }
 
 
-GlyphInfo addGlyph(std::ofstream &cpp, FT_Face &face, int code, const std::string &s, int &offset) {
-	GlyphInfo info;
+/**
+ * Add monochome placeholder that is inserted for unknown characters
+ */
+GlyphInfo addMonoPlaceholder(GlyphInfo &info, int w, int h) {
+    info.y = h;
+    info.w = w;
+    info.h = h;
 
-	int error = FT_Load_Char(face, code, FT_LOAD_TARGET_MONO /*FT_LOAD_TARGET_NORMAL*/ /*| FT_LOAD_FORCE_AUTOHINT*/);
-	auto glyph = face->glyph;
+    int m = w / 2;
 
-	// get glyph descriptor
-	FT_Glyph glyphDesc;
-	error = FT_Get_Glyph(glyph, &glyphDesc);
-	if (glyphDesc->format == FT_GLYPH_FORMAT_OUTLINE) {
-		// embolden glyph
-		auto* outlineGlyph = reinterpret_cast<FT_OutlineGlyph>(glyphDesc);
-		//FT_Outline_Embolden(&outlineGlyph->outline, weight);
+    int pitch = (w + 7) / 8;
+    info.data.resize(pitch * h);
+    for (int j = 0; j < h; ++j) {
+        uint8_t *row = info.data.data() + j * pitch;
+        for (int i = 0; i < w; ++i) {
+            int x = std::min(i, w - 1 - i);
+            int y = std::min(j, h - 1 - j);
 
-		// render glyph
-		FT_Glyph_To_Bitmap(&glyphDesc, FT_RENDER_MODE_MONO/*FT_RENDER_MODE_NORMAL*/, nullptr, 1);
-		auto* bitmapGlyph = reinterpret_cast<FT_BitmapGlyph>(glyphDesc);
-		FT_Bitmap& bitmap = bitmapGlyph->bitmap;
+            bool border = x == 0 || y == 0;
+            bool cross = w >= 7 && (y == x || (y > x && x == m));
 
-		info.offset = offset;
-		info.s = s.size();
-		info.y = glyph->bitmap_top;
-		info.w = bitmap.width;
-		info.h = bitmap.rows;
+            if (border || cross)
+                row[i / 8] |= 0x80 >> (i & 7);
+        }
+    }
 
-		cpp << "\t";
-		cpp << std::hex;
-		for (uint8_t ch : s) {
-			cpp << "0x" << std::setw(2) << std::setfill('0') << int(ch) << ", ";
-		}
-		cpp << std::dec;
-		cpp << "// ";
-		if (s == " " || s == "\\")
-			cpp << "'" << s << "'";
-		else
-			cpp << s;
-		cpp << std::endl;
+    return info;
+}
 
-		uint8_t *buffer = bitmap.buffer;
-		/*for (int j = 0; j < bitmap.rows; ++j) {
-			// write bytes
-			int byte = 0;
-			int bit = 0x80;
-			for (int i = 0; i < bitmap.width; ++i) {
-				if (bit == 0) {
-					bit = 0x80;
-					cpp << "0x" << std::setw(2) << std::setfill('0') << byte << ", ";
-				}
+GlyphInfo addGrayPlaceholder(GlyphInfo &info, int w, int h) {
+    info.y = h;
+    info.w = w;
+    info.h = h;
 
-				if (buffer[i] >= 128)
-					byte |= bit;
-				bit >>= 1;
-			}
-			cpp << "0x" << std::setw(2) << std::setfill('0') << byte << ", // ";
+    int m = w / 2;
 
-			// write comment
-			for (int i = 0; i < bitmap.width; ++i) {
-				cpp << (buffer[i] >= 128 ? '#' : ' ');
-			}
-			cpp << std::endl;
+    info.data.resize(w * h);
+    for (int j = 0; j < h; ++j) {
+        uint8_t *row = info.data.data() + j * w;
+        for (int i = 0; i < w; ++i) {
+            int x = std::min(i, w - 1 - i);
+            int y = std::min(j, h - 1 - j);
 
-			buffer += bitmap.pitch;
-		}*/
-		writeMonoBitmap(cpp, bitmap.buffer, bitmap.width, bitmap.rows, bitmap.pitch);
+            bool border = x == 0 || y == 0;
+            bool cross = w >= 7 && (y == x || (y > x && x == m));
 
-		offset += s.size() + bitmap.rows * ((bitmap.width + 7) / 8);
-	}
+            row[i] = (border || cross) ? 255 : 0;
+        }
+    }
 
-	return info;
+    return info;
+}
+
+
+/**
+ * Set glyph data
+ */
+GlyphInfo setGlyph(GlyphInfo &info, FT_Face &face, int code, FT_Render_Mode mode) {
+    int error = FT_Load_Char(face, code, FT_LOAD_TARGET_(mode) /*| FT_LOAD_FORCE_AUTOHINT*/);
+    auto glyph = face->glyph;
+
+    // get glyph descriptor
+    FT_Glyph glyphDesc;
+    error = FT_Get_Glyph(glyph, &glyphDesc);
+    if (glyphDesc->format == FT_GLYPH_FORMAT_OUTLINE) {
+        // embolden glyph
+        auto* outlineGlyph = reinterpret_cast<FT_OutlineGlyph>(glyphDesc);
+        //FT_Outline_Embolden(&outlineGlyph->outline, weight);
+
+        // render glyph
+        FT_Glyph_To_Bitmap(&glyphDesc, mode, nullptr, 1);
+        auto* bitmapGlyph = reinterpret_cast<FT_BitmapGlyph>(glyphDesc);
+        FT_Bitmap& bitmap = bitmapGlyph->bitmap;
+
+        info.y = glyph->bitmap_top;
+        info.w = bitmap.width;
+        info.h = bitmap.rows;
+
+        auto buffer = bitmap.buffer;
+        int w = mode == FT_RENDER_MODE_MONO ? (bitmap.width + 7) / 8 : bitmap.width;
+        for (int i = 0; i < bitmap.rows; ++i) {
+            info.data.insert(info.data.end(), buffer, buffer + w);
+            buffer += bitmap.pitch;
+        }
+    }
+
+    return info;
+}
+
+
+/**
+ * Write monochrome glyph data as hex bytes
+ */
+void writeMonoData1D(std::ofstream &cpp, GlyphInfo &info, int &offset) {
+    cpp << std::hex;
+    int w = (info.w + 7) / 8;
+    auto buffer = info.data.data();
+    for (int j = 0; j < info.h; ++j) {
+        cpp << INDENT;
+
+        // write row
+        for (int i = 0; i < w; ++i) {
+            cpp << "0x" << std::setw(2) << std::setfill('0') << int(buffer[i]) << ", ";
+        }
+
+        // write glyph as comment
+        cpp << "// ";
+        for (int i = 0; i < info.w; ++i) {
+            cpp << ((buffer[i / 8] & (0x80 >> (i & 7))) != 0 ? '#' : ' ');
+        }
+        cpp << std::endl;
+
+        buffer += w;
+    }
+    cpp << std::endl;
+    cpp << std::dec;
+
+    info.offset = offset;
+    offset += info.data.size();
+}
+
+/**
+ * Write gray glyph data as hex bytes
+ */
+void writeGrayData1D(std::ofstream &cpp, GlyphInfo &info, int &offset) {
+    cpp << std::hex;
+    auto buffer = info.data.data();
+    for (int j = 0; j < info.h; ++j) {
+        cpp << INDENT;
+
+        // write row
+        for (int i = 0; i < info.w; ++i) {
+            cpp << "0x" << std::setw(2) << std::setfill('0') << int(buffer[i]) << ", ";
+        }
+
+        // write glyph as comment
+        cpp << "// ";
+        for (int i = 0; i < info.w; ++i) {
+            cpp << ((buffer[i] & 0x80) != 0 ? '#' : ' ');
+        }
+        cpp << std::endl;
+
+        buffer += info.w;
+    }
+    cpp << std::endl;
+    cpp << std::dec;
+
+    info.offset = offset;
+    offset += info.data.size();
+}
+
+
+struct int2 {
+    int x;
+    int y;
+};
+
+void addGrayData2D(std::vector<uint8_t> &texture, int width, GlyphInfo &info, int2 &offset, int& rowHeight) {
+    if (offset.x + info.w + 1 > width) {
+        offset.x = 1;
+        offset.y += rowHeight + 1;
+        rowHeight = 0;
+    }
+    for (int j = 0; j < info.h; ++j) {
+        auto src = info.data.begin() + j * info.w;
+        auto dst = texture.begin() + (offset.y + j) * width + offset.x;
+        std::copy(src, src + info.w, dst);
+    }
+
+    info.offset = offset.x | (offset.y << 12);
+    offset.x += info.w + 1;
+    rowHeight = std::max(rowHeight, info.h);
+}
+
+void writeGrayData2D(std::ofstream &cpp, const std::vector<uint8_t> &texture, int w, int h) {
+    cpp << std::hex;
+    auto buffer = texture.data();
+    for (int j = 0; j < h; ++j) {
+        cpp << INDENT;
+
+        // write row
+        for (int i = 0; i < w; ++i) {
+            cpp << "0x" << std::setw(2) << std::setfill('0') << int(buffer[i]) << ", ";
+        }
+
+        // write row as comment
+        cpp << "// ";
+        for (int i = 0; i < w; ++i) {
+            cpp << ((buffer[i] & 0x80) != 0 ? '#' : ' ');
+        }
+        cpp << std::endl;
+
+        buffer += w;
+    }
+    cpp << std::endl;
+    cpp << std::dec;
 }
 
 
 /*
-	Usage: Label_Tool <text file>
+    Usage: FontTool <font> [options]
+        font: True Type font (.ttf)
+        options
+            <x>pt: Size (default is 8pt)
+            mono: Monochrome (default)
+            8bpp: 8 bit per pixel
+            tex: Output glyphs on 2D texture
 */
 int main(int argc, char **argv) {
-	if (argc < 3)
-		return 1;
+    //SetConsoleOutputCP(CP_UTF8);
+    //setvbuf(stdout, nullptr, _IOFBF, 1000);
+    //std::cout << "Ω" << std::endl;
+    if (argc < 2)
+        return 1;
 
-	// font input path
-	fs::path inPath = argv[1];
-	int fontSize = std::stoi(argv[2]);
+    // font input path
+    fs::path inPath = argv[1];
 
+    // arguments
+    int fontSize = 8;
+    FT_Render_Mode mode = FT_RENDER_MODE_MONO;
+    bool tex = false;
+    for (int i = 2; i < argc; ++i) {
+        auto arg = std::string_view(argv[i]);
+        if (arg.ends_with("pt"))
+            fontSize = std::stoi(std::string(arg.substr(0, arg.size() - 2)));
+        else if (arg == "8bpp")
+            mode = FT_RENDER_MODE_NORMAL;
+        else if (arg == "tex")
+            tex = true;
+    }
 
-	std::string name = inPath.stem().string() + std::to_string(fontSize) + "pt";
+    // construct name
+    std::string name = inPath.stem().string() + std::to_string(fontSize) + "pt";
+    if (mode == FT_RENDER_MODE_MONO)
+        name += "1bpp";
+    else
+        name += "8bpp";
 
-	auto hppPath = inPath.parent_path() / (name + ".hpp");
-	auto cppPath = inPath.parent_path() / (name + ".cpp");
-
-
-	// init freetype
-	// -------------
-
-	// https://freetype.org/freetype2/docs/tutorial/step1.html
-	FT_Library library;
-	auto error = FT_Init_FreeType(&library);
-
-	FT_Face face;
-	error = FT_New_Face(library, inPath.string().c_str(), 0, &face);
-	if (error) {
-		std::cerr << "Unable to load font" << std::endl;
-		exit(1);
-	}
-
-
-	// set initial font height
-	FT_Size_RequestRec sizeInfo{
-		FT_SIZE_REQUEST_TYPE_NOMINAL,
-		fontSize << 6,
-		fontSize << 6,
-		96,
-		96
-	};
-	error = FT_Request_Size(face, &sizeInfo);
+    // construct output file paths
+    auto hppPath = inPath.parent_path() / (name + ".hpp");
+    auto cppPath = inPath.parent_path() / (name + ".cpp");
 
 
-	std::ofstream hpp(hppPath.string(), std::ofstream::out | std::ofstream::trunc);
-	std::ofstream cpp(cppPath.string(), std::ofstream::out | std::ofstream::trunc);
+    // init freetype
+    // -------------
+
+    // https://freetype.org/freetype2/docs/tutorial/step1.html
+    FT_Library library;
+    auto error = FT_Init_FreeType(&library);
+
+    FT_Face face;
+    error = FT_New_Face(library, inPath.string().c_str(), 0, &face);
+    if (error) {
+        std::cerr << "Unable to load font" << std::endl;
+        exit(1);
+    }
 
 
-	std::map<std::string, GlyphInfo> glyphInfos;
-	int offset = 0;
+    // set initial font height
+    FT_Size_RequestRec sizeInfo{
+        FT_SIZE_REQUEST_TYPE_NOMINAL,
+        fontSize << 6,
+        fontSize << 6,
+        96,
+        96
+    };
+    error = FT_Request_Size(face, &sizeInfo);
 
-	cpp << "#include \"header.hpp\"" << std::endl;
-	cpp << std::endl;
 
-	// data
-	cpp << "const uint8_t " << name << "Data[] = {" << std::endl;
-	glyphInfos[std::string()] = addPlaceholder(cpp, offset);
-	for (char ch = '!'; ch <= '~'; ++ch) {
-		std::string s(1, ch);
-		GlyphInfo info = addGlyph(cpp, face, ch, s, offset);
-		glyphInfos[s] = info;
-	}
-	const char *chars[] = {
-		"°",
-		"Ä",
-		"Ö",
-		"Ü",
-		"ß",
-		"ä",
-		"ö",
-		"ü",
-	};
-	for (auto ch : chars) {
-		std::string s(ch);
+    std::ofstream hpp(hppPath.string(), std::ofstream::out | std::ofstream::trunc);
+    std::ofstream cpp(cppPath.string(), std::ofstream::out | std::ofstream::trunc);
 
-		std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t> convert;
-		int code = convert.from_bytes(s)[0];
 
-		GlyphInfo info = addGlyph(cpp, face, code, s, offset);
-		glyphInfos[s] = info;
-	}
-	cpp << "};" << std::endl;
+    // collect glyphs
+    std::vector<GlyphInfo> glyphInfos;
+    glyphInfos.emplace_back(std::string());
+    const char *spaces[] = {
+        " "
+    };
+    for (auto ch : spaces) {
+        glyphInfos.emplace_back(ch, false);
+    }
+    for (char ch = '!'; ch <= '~'; ++ch) {
+        std::string s(1, ch);
+        glyphInfos.emplace_back(s);
+    }
+    const char *chars[] = {
+        "°",
+        "Ä",
+        "Ö",
+        "Ü",
+        "ß",
+        "ä",
+        "ö",
+        "ü",
+        "Ω",
+        "μ",
+    };
+    for (auto ch : chars) {
+        glyphInfos.emplace_back(ch);
+    }
 
-	// glyphs
-	int maxY = 0;
-	for (auto [s, info] : glyphInfos) {
-		maxY = std::max(info.y, maxY);
-	}
-	cpp << "const Font::Glyph " << name << "Glyphs[] = {" << std::endl;
-	int height = 0;
-	for (auto [s, info] : glyphInfos) {
-		int y = maxY - info.y;
-		cpp << "\t{" << info.offset << ", " << info.s << ", " << y << ", " << info.w << ", " << info.h << "}," << " // ";
-		if (s == " " || s == "\\")
-			cpp << "'" << s << "'";
-		else
-			cpp << s;
-		cpp << std::endl;
-		height = std::max(y + info.h, height);
-	}
-	cpp << "};" << std::endl;
+    // get glyph data
+    int heightl = 0;
+    for (auto &info : glyphInfos) {
+        if (!info.text.empty()) {
+            // get character code from utf-8 string
+            std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t> convert;
+            int code = convert.from_bytes(info.text)[0];
 
-	// font
-	cpp << "extern const Font " << name << " = {" << std::endl;
-	cpp << "\t1, 2, 5, " << height << ", " << name << "Data, " << name << "Glyphs, " << name << "Glyphs + " << glyphInfos.size() << "," << std::endl;
-	cpp << "};" << std::endl;
-	cpp << std::endl;
-	cpp << "#include \"footer.hpp\"" << std::endl;
+            if (info.printable) {
+                // printable glyph
+                setGlyph(info, face, code, mode);
+                info.t = code;
 
-	// header file
-	hpp << "#pragma once" << std::endl;
-	hpp << std::endl;
-	hpp << "#include \"header.hpp\"" << std::endl;
-	hpp << std::endl;
-	hpp << "extern const Font " << name << ";" << std::endl;
-	hpp << std::endl;
-	hpp << "#include \"footer.hpp\"" << std::endl;
+                if (code == 'l')
+                    heightl = info.h;
+
+                // print to console
+                std::cout << code << ' ';
+                //std::cout << info.text;
+            } else {
+                // non-printable
+                info.t = code;
+                info.offset = 0xffffff;
+                info.y = 0;
+                info.w = fontSize / 10 + 1;
+                info.h = 0;
+            }
+        }
+    }
+    std::cout << std::endl;
+
+    // generate placeholder glyph for unknown characters
+    {
+        auto &info = glyphInfos.front();
+        int w = heightl * 2 / 3 | 1;
+        if (mode == FT_RENDER_MODE_MONO)
+            addMonoPlaceholder(info, w, heightl);
+        else
+            addGrayPlaceholder(info, w, heightl);
+        info.t = 0;
+    }
+
+
+    // determine texture width
+    int pixelHeight = sizeInfo.vertResolution * sizeInfo.height / 72 >> 6;
+    int pixelCount = pixelHeight * pixelHeight * glyphInfos.size();
+    int textureWidth = int(std::sqrt(pixelCount) + 3) & ~3;
+    int textureHeight = pixelCount / textureWidth * 2;
+
+    // generate cpp file
+    cpp << "#include \"header.hpp\"" << std::endl;
+    cpp << std::endl;
+
+    // write bitmap data for all glyphs
+    cpp << "const uint8_t " << name << "Data[] = {" << std::endl;
+    int dataSize;
+    if (!tex) {
+        // linear data
+        int offset = 0;
+        for (auto &info : glyphInfos) {
+            if (info.printable) {
+                if (mode == FT_RENDER_MODE_MONO)
+                    writeMonoData1D(cpp, info, offset);
+                else
+                    writeGrayData1D(cpp, info, offset);
+            }
+        }
+        dataSize = offset;
+    } else {
+        // texture (2D) data
+        std::vector<uint8_t> texture;
+        int2 offset = {1, 1};
+        int rowHeight = 0;
+        texture.resize(textureWidth * textureHeight);
+        for (auto &info : glyphInfos) {
+            if (info.printable) {
+                addGrayData2D(texture, textureWidth, info, offset, rowHeight);
+            }
+        }
+        int textureHeight = offset.y + rowHeight + 1;
+        writeGrayData2D(cpp, texture, textureWidth, textureHeight);
+        dataSize = textureWidth | (textureHeight << 16);
+    }
+    cpp << "};" << std::endl;
+
+    // determine maximum y coordinate of all glyphs
+    int maxY = 0;
+    for (auto &info : glyphInfos) {
+        maxY = std::max(info.y, maxY);
+    }
+
+    // write Glyph structures
+    cpp << "const GlyphInfo " << name << "Glyphs[] = {" << std::endl;
+    int height = 0;
+    for (auto &info : glyphInfos) {
+        int y = maxY - info.y;
+
+		// t (glyph text): 18 bit
+		// w : 7 bit
+		// h : 7 bit
+		uint32_t infoX = info.t | (info.w << 18) | (info.h << 25);
+
+		// offset: 24 bit
+		// y : 7 bit
+		// flag (glyph code or offset): 1 bit
+		uint32_t infoY = info.offset | (y << 24);
+
+        cpp << INDENT << "{" << infoX << ", " << infoY << "},";
+
+        // text represented by the glyph as comment
+        cpp << " // ";
+        if (info.text == " " || info.text == "\\")
+            cpp << "'" << info.text << "'";
+        else
+            cpp << info.text;
+        cpp << std::endl;
+
+        height = std::max(y + info.h, height);
+    }
+    cpp << "};" << std::endl;
+
+    // write font
+    int gapWidth = fontSize >= 10 ? 2 : 1;
+    cpp << "extern const " << (tex ? "Texture" : "Linear") << "Font " << name << " = {" << std::endl;
+    {
+        //cpp << INDENT << "1, 2, 5, " << std::endl; // gapWidth, spaceWidth, tabWidth
+        cpp << INDENT << gapWidth << "," << std::endl;
+        cpp << INDENT << height << "," << std::endl;
+        cpp << INDENT << name << "Data, " << dataSize << "," << std::endl;
+        cpp << INDENT << name << "Glyphs, " << name << "Glyphs + " << glyphInfos.size() << "," << std::endl;
+    }
+    cpp << "};" << std::endl;
+    cpp << std::endl;
+    cpp << "#include \"footer.hpp\"" << std::endl;
+
+    // generate header file
+    hpp << "#pragma once" << std::endl;
+    hpp << std::endl;
+    hpp << "#include \"header.hpp\"" << std::endl;
+    hpp << std::endl;
+    hpp << "extern const " << (tex ? "Texture" : "Linear") << "Font " << name << ";" << std::endl;
+    hpp << std::endl;
+    hpp << "#include \"footer.hpp\"" << std::endl;
 }
